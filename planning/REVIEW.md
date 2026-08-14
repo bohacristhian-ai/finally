@@ -307,3 +307,96 @@ All remaining items have since been resolved:
 **Also added: §13 Build Order** — three stages with four parallel Stage 2 tracks, plus working agreements (contracts are frozen; no migrating off Next.js/Recharts/SSE; progress recorded in `PROGRESS.md`). This is what the specification was missing to be actionable rather than merely correct.
 
 The specification is ready to build against.
+---
+
+# Part IV — Review of Commit `765932b` ("Start Projekt Finally")
+
+*Parts II and III reviewed the working tree against `6b568a9`. This part reviews `6b568a9..765932b` — specifically the R1–R7 resolutions and §13 Build Order, which were written **after** Part III and therefore went into the commit unreviewed.*
+
+**Scope:** 8 files, +1767/−53. `planning/PLAN.md` (456 → 719) plus seven new files. Documentation only; still no source code.
+
+## 18. Defects in the Resolutions
+
+**S1 — The `HEALTHCHECK` calls `curl`, which does not exist in the base image. (Concrete; fails at runtime.)** §11 Stage 2 is `python:3.12-slim`, and Debian slim images ship no `curl`. The instruction added for R3 is:
+
+```
+HEALTHCHECK: curl -f http://localhost:8000/api/health
+```
+
+Docker would run this, fail to find the binary, and mark the container **unhealthy** — on a container that is working perfectly. Worse, R3's whole point was that the health endpoint was claimed but never wired up; the fix wired it to something that cannot execute.
+*Recommendation:* use the interpreter that is guaranteed present rather than adding a package:
+```
+HEALTHCHECK CMD python -c "import urllib.request,sys; \
+  sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health').status==200 else 1)"
+```
+
+**S2 — The 60-minute buffer is 14× larger than what it replaced, and its cost was never stated.** R2 traded a point count for a duration, which was right, but 60 minutes at the simulator's 500ms cadence is **7,200 points per ticker**, not 500. Two consequences neither `PLAN.md` nor `MARKET_DATA.md` mentions:
+
+- **Memory**: at the §8 watchlist cap of 50 tickers that is 360,000 points. Stored naively as Python objects with ISO-string timestamps (~100 bytes/point) that is ~36 MB of live heap for a chart nobody may open. Storing `(epoch_float, price)` tuples — or a single start time plus a flat price array, since the cadence is fixed — brings it to ~6 MB
+- **Trade latency**: backfill now runs on ticker admission (§6), which is on the `POST /api/portfolio/trade` request path. Generating 7,200 backward GBM steps inside a trade request is work that used to be 500 steps at startup only
+
+*Recommendation:* specify the storage representation, and either backfill lazily (on first `GET /api/history/{ticker}`) or cap admission-time backfill to a few hundred points and let the buffer fill forward.
+
+**S3 — Track A and Track B are not actually independent.** §13 states Stage 2 tracks "run concurrently. Each depends only on the frozen contracts." But Track B's trade path calls `try_immediate_price()`, which Track A owns (`MARKET_DATA.md`), and reads the price cache Track A builds. B cannot execute a single trade until that part of A exists.
+*Recommendation:* either move the cache and source interface into Stage 1 (they are foundational, not market-data-specific), or state the dependency plainly so Track B stubs the interface rather than discovering the coupling mid-build.
+
+**S4 — `PROGRESS.md` is mandated but does not exist and is not in the directory tree.** §13's working agreements require recording progress in `planning/PROGRESS.md`; §4's tree lists `API_CONTRACT.md`, `MARKET_DATA.md`, `REVIEW.md` and the translations, but not `PROGRESS.md`. An agent following §4 will not know to create it.
+*Recommendation:* add it to the §4 tree, and seed the file with the §13 stage checklist so the first agent appends rather than inventing a format.
+
+**S5 — Downsampling is specified without an algorithm.** `GET /api/history/{ticker}` "downsamples to at most 500 points on read" (both `PLAN.md` and `API_CONTRACT.md`). Naive stride sampling on a 7,200-point series discards 93% of samples and will visibly swallow the 2–5% simulator events (`MARKET_DATA.md`) that exist precisely to make the chart dramatic.
+*Recommendation:* specify min/max bucketing (or LTTB) so extremes survive. This matters more here than in most charts because the spikes are a designed feature.
+
+**S6 — `CLAUDE.de.md` now points at a document that tells readers not to use it.** R7 added a prominent "do not use as a build reference" header to `PLAN.de.md`; `CLAUDE.de.md` still contains `@planning/PLAN.de.md`. The file is inert (only `CLAUDE.md` is auto-loaded, per D1), so nothing breaks — but as a human-facing artifact it now instructs the reader to load a document marked unusable.
+*Recommendation:* point `CLAUDE.de.md` at `PLAN.md`, or delete it as redundant with `CLAUDE.md`.
+
+## 19. Verified Sound
+
+- **R1 fix is coherent across all three documents.** The five-step execution order in §8, the *Admission on Trade* subsection in §6, and `try_immediate_price()` in `MARKET_DATA.md` agree; the retry message is byte-identical between `PLAN.md` and `API_CONTRACT.md`; the sticky-15-minute window closes the eviction loop the naive fix would have created
+- **The 60-minute window is stated consistently** in `PLAN.md` §6 (cache table and prose), `API_CONTRACT.md`, and `MARKET_DATA.md` backfill — no residual "500 ticks" outside the historical record in this file
+- **`api.massive.dev` → `api.massive.com` is corrected everywhere**, with the legacy Polygon base documented and the remaining uncertainty correctly narrowed to response field names rather than left blanket
+- **`change_pct` now has exactly one derivation** (client-side, from `price` and `session_ref`) in both the initial-paint and live paths
+- **The async/sync split in the source Protocol is deliberate** — `fetch()` is `async`, `try_immediate_price()` is not, because it must never block on a network call. Worth leaving as-is; an agent "fixing" the inconsistency would reintroduce the starvation problem `MassiveSource` avoids
+
+## 20. Assessment
+
+The R1–R7 resolutions hold up: every contradiction Part III identified is genuinely closed, and the three documents agree on every value cross-checked. The new defects are all in material written after Part III.
+
+**S1 is the one that would actually break something** — a container marked unhealthy by a health check that cannot run. It is a two-line fix and should land before Stage 1.4. **S2** is the most consequential design point, because R2's fix silently made the buffer 14× larger on a path that now includes trade execution. S3–S6 are documentation coherence and cost little to fix.
+
+None of these blocks Stage 1.1 (backend scaffold), which has no dependency on any of them.
+
+---
+
+# Part V — Independent Review (codex)
+
+### Critical
+
+1. **The Massive polling/broadcast design is self-contradictory.** `PLAN.md` §6 requires a *single* loop which "ticks the price model and then broadcasts," while `MARKET_DATA.md` says that same loop calls `fetch()` and broadcasts. But `MARKET_DATA.md` also says the Massive poll interval is independent from an SSE broadcast cadence, and `PLAN.md` describes a 15-second poll versus a 500-ms broadcast cadence. One loop cannot simultaneously be a 15-second fetch loop and an independent 500-ms broadcast loop. Specify one scheduler (for example, a 500-ms loop that conditionally polls Massive when due and broadcasts only after a cache change), including which timestamp becomes SSE `ts` and how heartbeats are scheduled.
+
+2. **The source interface loses `session_ref`.** `MarketDataSource.fetch()` returns only `dict[str, float]`, yet the Massive contract requires parsing `prevDay.c` into `session_ref`; the cache/SSE/watchlist contracts require that value. There is no return field or other defined channel by which `MassiveSource` can provide it. Change the interface to return a quote object (price plus optional reference/timestamp), or explicitly assign `prevDay.c` inside a defined cache-update adapter.
+
+3. **Massive-mode startup can make the portfolio API impossible to satisfy.** After restart the in-memory cache is empty and Massive can fail or not yet have polled. Existing SQLite positions then have no `current_price`, but `GET /api/portfolio` requires numeric `current_price`, `market_value`, `total_value`, P&L, and weights; unlike `GET /api/watchlist`, it permits no `null`. The startup snapshot has the same dependency. Define a readiness policy and missing-price representation/calculation (or persist a last price), and state whether the startup snapshot waits for initial prices.
+
+4. **The Docker health check will fail in the specified final image.** Stage 2 is `python:3.12-slim` and invokes `curl -f`, but the plan never installs `curl`; slim images normally do not include it. Install curl, or implement the health check with Python/another available executable.
+
+### High
+
+5. **`session_ref` rules disagree across the normative documents.** `PLAN.md` §6 says Massive uses the first observed price after startup. `MARKET_DATA.md` says use `prevDay.c` when present and first observed price only as a fallback. The latter is a more useful behavior but it must be made consistently authoritative; otherwise the displayed “session change” changes meaning by implementation choice.
+
+6. **The tracked-set lifecycle is underspecified for non-trade admissions.** The tracked set is defined as the watchlist, positions, and recent trade attempts, but only trade admission says exactly when a cache entry/history backfill is created. `POST /api/watchlist` returns successfully without defining whether simulator pricing/backfill is synchronous, when Massive first polls it, or how the background loop observes database changes safely. This affects the promised first-load prices and the allowed `null` watchlist fields. Define admission behavior for initial seed data and watchlist additions.
+
+7. **Massive batching has no size/error policy.** A watchlist can contain 50 tickers, and positions/trade attempts are unbounded, but the Massive request assumes one comma-separated `tickers` query. The specification does not give the provider’s maximum ticker count/URL size, batch chunking behavior, quota accounting for multiple batches, or behavior if one batch fails. This can exceed a provider limit or the stated five-calls-per-minute budget.
+
+8. **Unknown-symbol deterministic pricing is not reproducible as written.** “Seed the RNG from the ticker string” does not prescribe a stable algorithm/byte encoding/range conversion; using Python’s built-in `hash()` would vary between processes. “Across restarts within a session” is also ambiguous, since there is no named session. Specify a stable hash (e.g., SHA-256-derived integer), the exact mapping to `[20, 400]`, and whether repeatability is across all restarts.
+
+### Medium
+
+9. **Chat persistence and action ordering need explicit semantics.** `GET /api/chat` promises durable conversation history, while the chat flow says it stores “the message and action outcomes,” but does not expressly require storing the user message before an unavailable/failed LLM call. It also does not state whether multiple model actions execute in listed order, whether they are atomic, or what happens after an action succeeds and a later action fails. Define these rules so history and action chips are repeatable and testable.
+
+10. **Chat mutations do not return enough state for an immediate UI refresh.** A manual trade returns the resulting portfolio, but `POST /api/chat` returns only prose/actions. A successful chat trade changes cash/positions and a chat watchlist change changes the grid; neither change is delivered as complete state. The frontend can choose to refetch `GET /api/portfolio` and `GET /api/watchlist`, but that required reconciliation step is unstated. State it explicitly (and whether the refetches occur after all actions), or include resulting resources in the chat response.
+
+11. **Request validation is incomplete for several public inputs.** The API defines ticker normalization for responses/input generally, but does not say whether path ticker parameters (`DELETE /api/watchlist/{ticker}`, history) are trimmed/uppercased and format-validated, nor how invalid `limit` values (noninteger, zero/negative, above max) and an empty/oversized chat message behave. These are necessary to implement the stated universal error/status convention consistently.
+
+12. **The static-export development proxy needs a verified configuration.** The plan requires `output: 'export'` and supplies a `rewrites()` proxy. Next.js static export does not support rewrites in exported output, and the conditional function may or may not be accepted by the particular Next.js version during `next build`. Pin a tested Next.js version/configuration, or define a development-only config/proxy mechanism that is excluded from export builds; otherwise the required build can fail before the backend is reached.
+
+13. **The Massive response is knowingly unverified but still called a frozen normative contract.** `MARKET_DATA.md` explicitly says the endpoint field names are unconfirmed and must be checked against live documentation, while `PLAN.md` says the contracts are frozen and identifies R6 as the only open item; this review file did not exist before this section, so R6 has no actionable record. A build agent needs an owner, verification date/test fixture source, and a rule for what to do if the real schema differs. Until then, Massive mode cannot be reliably implemented or tested.
