@@ -207,7 +207,7 @@ Oldest first. When `limit` truncates, the **most recent** `limit` points are ret
 { "ticker": "PYPL", "added_at": "2026-08-11T14:01:00.000Z" }
 ```
 
-**Errors**: 400 if the symbol fails validation (`MARKET_DATA.md`) or the 50-ticker cap is reached.
+**Errors**: 400 if the symbol fails validation (trimmed/uppercased, must match `^[A-Z]{1,5}$`; see `PLAN.md` §8 and `MARKET_DATA_SUMMARY.md`) or the 50-ticker cap is reached.
 
 ---
 

@@ -2,9 +2,7 @@
 
 ## Project Specification
 
-> **Companion documents.** This plan is the readable specification. Two documents hold the exact machine-readable contracts and are normative where they overlap with prose here:
-> - **[`API_CONTRACT.md`](API_CONTRACT.md)** — exact request/response bodies, SSE payload, error shape, `actions` JSON.
-> - **[`MARKET_DATA.md`](MARKET_DATA.md)** — simulator parameters, ticker seed table, Massive API request/response contract.
+> **Companion documents.** This plan is the readable specification. **[`API_CONTRACT.md`](API_CONTRACT.md)** holds the exact machine-readable contract — request/response bodies, SSE payload, error shape, `actions` JSON — and is normative where it overlaps with prose here. Market data parameters (simulator model, ticker seed table, Massive API contract) are no longer a separate frozen spec: the component is built, and **[`MARKET_DATA_SUMMARY.md`](MARKET_DATA_SUMMARY.md)** summarizes what was implemented, with full design history in `planning/archive/`.
 >
 > A German translation exists at `PLAN.de.md`. **The English version is authoritative**; the translation reflects commit `6b568a9` and has not been updated with the revisions below.
 
@@ -104,7 +102,7 @@ finally/
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document — the readable specification
 │   ├── API_CONTRACT.md       # Exact request/response, SSE payload, error shape
-│   ├── MARKET_DATA.md        # Simulator parameters, seed prices, Massive contract
+│   ├── MARKET_DATA_SUMMARY.md # Summary of the completed market data component
 │   ├── REVIEW.md             # Review notes that produced this revision
 │   └── *.de.md               # German translations (not authoritative)
 ├── scripts/
@@ -128,7 +126,7 @@ finally/
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
 - **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via a bind mount (see §11).
-- **`planning/`** contains project-wide documentation. All agents reference files here as the shared contract. `PLAN.md` is the entry point; `API_CONTRACT.md` and `MARKET_DATA.md` are normative for the details they cover.
+- **`planning/`** contains project-wide documentation. All agents reference files here as the shared contract. `PLAN.md` is the entry point; `API_CONTRACT.md` is normative for the details it covers.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
 - **`scripts/`** contains start/stop scripts that wrap Docker commands.
 
@@ -172,7 +170,7 @@ LLM_MOCK=false
 
 Both the simulator and the Massive client implement the same abstract interface. The backend selects which to use based on the environment variable. All downstream code (SSE streaming, price cache, frontend) is agnostic to the source.
 
-Exact parameters, the seed price table, and the Massive request/response contract live in **[`MARKET_DATA.md`](MARKET_DATA.md)**.
+This component is built; exact parameters, the seed price table, and the Massive request/response contract as implemented are described in **[`MARKET_DATA_SUMMARY.md`](MARKET_DATA_SUMMARY.md)**, with full design history in `planning/archive/`.
 
 ### Tracked Ticker Set
 
@@ -192,7 +190,7 @@ So **a trade request admits its ticker to the tracked set before the price is re
 
 | Source | Behavior on admission |
 |---|---|
-| Simulator | A seed price is generated **synchronously** (deterministic per symbol, `MARKET_DATA.md`) and the ring buffer is backfilled. The trade proceeds within the same request |
+| Simulator | A seed price is generated **synchronously** (deterministic per symbol) and the ring buffer is backfilled. The trade proceeds within the same request |
 | Massive | No price is known until the next poll. The trade is rejected with a **retry** message (§8), but the ticker is now tracked, so the next attempt — within one poll interval — succeeds |
 
 Admission is idempotent and **sticky for 15 minutes**. A periodic sweep evicts tickers that are neither watchlisted nor held and have had no trade attempt within that window. Without the grace period a rejected Massive trade would evict its own ticker and the retry would fail forever; without the sweep, typos would accumulate in the tracked set indefinitely.
@@ -203,7 +201,7 @@ Admission is idempotent and **sticky for 15 minutes**. A periodic sweep evicts t
 - **Correlation uses a single market factor**, not a sector taxonomy: `return = beta × market_factor + idiosyncratic`, with `beta` defaulting to 1.0. This produces convincing correlated movement and handles user-added tickers with no maintained sector map
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
 - Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
-- Unknown tickers (not in the seed table) get a generated seed price and default drift/volatility — see `MARKET_DATA.md`
+- Unknown tickers (not in the seed table) get a generated seed price and default drift/volatility — see `MARKET_DATA_SUMMARY.md`
 - Runs as an in-process background task — no external dependencies
 
 ### Massive API (Optional)
@@ -404,7 +402,7 @@ The fourth case **cannot occur in simulator mode**, where step 3 always produces
 
 **Fill price** is the price resolved at step 3, which may differ slightly from the price the user saw. The response returns the actual fill price so the UI shows what really happened.
 
-**Ticker validation** (`POST /api/watchlist` and LLM-initiated additions) — see `MARKET_DATA.md` for the symbol rules. Tickers are uppercased and trimmed; adding a ticker already on the watchlist returns 200 idempotently rather than 409; the watchlist is capped at 50 tickers.
+**Ticker validation** (`POST /api/watchlist` and LLM-initiated additions) — same code path. Tickers are trimmed and uppercased, then checked against `^[A-Z]{1,5}$`; there is deliberately no check that a symbol exists in the real world (an unknown-but-well-formed symbol just gets a generated price series, per `MARKET_DATA_SUMMARY.md`). Adding a ticker already on the watchlist returns 200 idempotently rather than 409; the watchlist is capped at 50 tickers.
 
 ---
 
@@ -663,7 +661,7 @@ await page.unroute('**/api/stream/prices');
 
 ## 13. Build Order
 
-The contracts in `API_CONTRACT.md` and `MARKET_DATA.md` are frozen, which is what lets the frontend and backend proceed in parallel without waiting on each other. Build against the contract, not against the other agent's code.
+The contract in `API_CONTRACT.md` is frozen, which is what lets the frontend and backend proceed in parallel without waiting on each other. Build against the contract, not against the other agent's code. (Market data parameters were likewise frozen in a dedicated `MARKET_DATA.md` while Track A was in flight; that component is now complete and the doc has been retired in favor of `MARKET_DATA_SUMMARY.md`.)
 
 ### Stage 1 — Foundation (blocks everything)
 
@@ -681,7 +679,7 @@ Stage 1 is done when `docker run` serves an empty page at `:8000` and `/api/heal
 Once Stage 1 lands, these run concurrently. Each depends only on the frozen contracts.
 
 **Track A — Market data & streaming**
-- `MarketDataSource` interface, `SimulatorSource` with the one-factor model and seed table (`MARKET_DATA.md`)
+- `MarketDataSource` interface, `SimulatorSource` with the one-factor model and seed table (`MARKET_DATA_SUMMARY.md`)
 - Price cache with `session_ref`, 60-minute ring buffer, synthetic backfill
 - Single background loop: tick → cache → broadcast changed only (§6)
 - `GET /api/stream/prices`, `GET /api/history/{ticker}`
@@ -713,7 +711,7 @@ Written alongside each track by its owner, not deferred to a separate pass.
 
 ### Working Agreements
 
-- **The contracts are frozen.** If implementation reveals a contract is wrong, change `API_CONTRACT.md` / `MARKET_DATA.md` first and say so — do not diverge silently and do not work around it locally
+- **The contract is frozen.** If implementation reveals `API_CONTRACT.md` is wrong, change it first and say so — do not diverge silently and do not work around it locally
 - **Do not migrate off Next.js, Recharts, or SSE** (§3, §10). These were decided deliberately; the reasoning is recorded where each is specified
 - **`planning/REVIEW.md`** holds the open items with priorities. R6 (Massive response field names) is the only unverified area of the spec and is confined to Track A's last task
 - **Record progress in `planning/PROGRESS.md`** — one line per completed item, so a fresh agent can see the state without reading the whole tree
